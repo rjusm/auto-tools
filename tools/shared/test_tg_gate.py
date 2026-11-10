@@ -110,6 +110,20 @@ class GateTest(unittest.TestCase):
         msgs = mock("GET", "/_mock/messages")
         self.assertEqual(msgs[-1]["text"], "без прогресса")
 
+    def test_notify_rich_sends_markdown_as_is(self):
+        table = "| A | B |\n|:--|--:|\n| x | 1 |"
+        r = self.run_gate("notify", table, "--rich")
+        self.assertEqual(r.returncode, 0)
+        msgs = mock("GET", "/_mock/messages")
+        self.assertEqual(msgs[-1]["text"], table)
+        self.assertTrue(msgs[-1]["rich"])
+
+    def test_notify_rich_with_step_uses_markdown_bold(self):
+        r = self.run_gate("notify", "таблица ниже", "--rich", "--step", "2/5")
+        self.assertEqual(r.returncode, 0)
+        msgs = mock("GET", "/_mock/messages")
+        self.assertEqual(msgs[-1]["text"], "**[2/5]** таблица ниже")
+
     # --- check ---
     def test_check_quiet_returns_0(self):
         self.assertEqual(self.run_gate("check").returncode, 0)
@@ -142,6 +156,17 @@ class GateTest(unittest.TestCase):
     def test_gate_stop_button(self):
         rc, _, _ = self.answer_gate(press="stop")
         self.assertEqual(rc, 10)
+
+    def test_gate_rich_sends_markdown_table(self):
+        table = "| Metric | Value |\n|:--|--:|\n| x | 1 |"
+        p = self.start_gate("gate", table, "--rich")
+        self.wait_prompt()
+        mock("POST", "/_mock/press", {"data": "go", "user_id": ME})
+        out, err = p.communicate(timeout=20)
+        self.assertEqual(p.returncode, 0)
+        msgs = mock("GET", "/_mock/messages")
+        self.assertEqual(msgs[0]["text"], table)
+        self.assertTrue(msgs[0]["rich"])
 
     def test_gate_stop_text(self):
         rc, _, _ = self.answer_gate(say="/stop")

@@ -132,6 +132,24 @@ def send(cfg, html_text, markup=None):
     return res["result"]["message_id"]
 
 
+def send_rich(cfg, markdown_text, markup=None):
+    """Отправляет через sendRichMessage (Bot API 10.1+, markdown-поле) — поддерживает
+    настоящие таблицы (GFM-синтаксис `| a | b |`), заголовки, списки и т.д., в отличие
+    от send()/sendMessage, который даёт только базовый HTML-набор (b/i/code/pre/...).
+    Текст в markdown_text передаётся как есть — вызывающий код сам отвечает за то,
+    чтобы markdown-спецсимволы (* _ ` | [ ] ~ = и т.д.) в "обычном" тексте либо были
+    осмысленной разметкой, либо не ломали структуру (экранирование тут не делается).
+    """
+    p = {"chat_id": cfg["SLOWQUERY_TG_CHAT_ID"], "rich_message": json.dumps({"markdown": markdown_text})}
+    if markup:
+        p["reply_markup"] = json.dumps(markup)
+    res = api(cfg, "sendRichMessage", p)
+    if not res.get("ok"):
+        sys.stderr.write("tg_gate: Telegram отклонил rich-сообщение\n")
+        sys.exit(2)
+    return res["result"]["message_id"]
+
+
 def get_offset():
     try:
         with open(STATE_FILE) as f:
@@ -185,14 +203,22 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     n = sub.add_parser("notify"); n.add_argument("text")
     n.add_argument("--step", metavar="N/M", help="прогресс, например 3/10 — добавится префиксом [3/10]")
+    n.add_argument("--rich", action="store_true",
+                    help="отправить через sendRichMessage (Bot API 10.1+): text — готовый markdown "
+                         "(GFM-таблицы, заголовки и т.д.), без HTML-экранирования/```-конвенции format_text")
     g = sub.add_parser("gate"); g.add_argument("text"); g.add_argument("--timeout", type=int, default=1800)
     g.add_argument("--step", metavar="N/M", help="прогресс, например 3/10 — добавится префиксом [3/10]")
+    g.add_argument("--rich", action="store_true", help="см. notify --rich")
     sub.add_parser("check")
     a = ap.parse_args()
     cfg = load_cfg()
 
     if a.cmd == "notify":
-        send(cfg, format_text(a.text, a.step))
+        if a.rich:
+            text = ("**[%s]** %s" % (a.step, a.text)) if a.step else a.text
+            send_rich(cfg, text[:RAW_TEXT_LIMIT])
+        else:
+            send(cfg, format_text(a.text, a.step))
         # заодно проверим, не просили ли остановиться
         rc = interpret(poll(cfg, 0))
         sys.exit(10 if rc == 10 else 0)
@@ -205,10 +231,15 @@ def main():
 
     if a.cmd == "gate":
         poll(cfg, 0)  # сбросить старые апдейты, чтобы не поймать прошлое нажатие
-        send(cfg, format_text(a.text, a.step), {"inline_keyboard": [[
+        markup = {"inline_keyboard": [[
             {"text": "Продолжить", "callback_data": "go"},
             {"text": "Пропустить этап", "callback_data": "skip"},
-            {"text": "Стоп", "callback_data": "stop"}]]})
+            {"text": "Стоп", "callback_data": "stop"}]]}
+        if a.rich:
+            text = ("**[%s]** %s" % (a.step, a.text)) if a.step else a.text
+            send_rich(cfg, text[:RAW_TEXT_LIMIT], markup)
+        else:
+            send(cfg, format_text(a.text, a.step), markup)
         deadline = time.time() + a.timeout
         while time.time() < deadline:
             rc = interpret(poll(cfg, min(25, max(1, int(deadline - time.time())))))

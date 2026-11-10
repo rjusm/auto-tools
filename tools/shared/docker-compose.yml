@@ -1,8 +1,8 @@
-# Запуск из tools/slow-query-fix:
+# Запуск из tools/shared (общий бот/моки для slow-query-fix и incident-triage):
 #   docker compose run --rm tests                              # тесты (мок Telegram + моки git/Jira)
 #   docker compose run --rm bot notify "проверка"              # настоящий бот, токен из .env.local
 #   docker compose run --rm bot gate "Продолжаем?" --timeout 120
-name: slow-query-fix
+name: shared-tools
 services:
   mock-telegram:
     build: .

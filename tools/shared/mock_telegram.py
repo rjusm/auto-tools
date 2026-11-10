@@ -94,6 +94,15 @@ class Handler(BaseHTTPRequestHandler):
                 STATE.sent.append(msg)
             return self._json({"ok": True, "result": {"message_id": msg["message_id"]}})
 
+        if method == "sendRichMessage":
+            with STATE.lock:
+                rich = json.loads(p["rich_message"]) if "rich_message" in p else {}
+                msg = {"message_id": len(STATE.sent) + 1, "chat_id": p.get("chat_id"),
+                       "text": rich.get("markdown", ""), "rich": True,
+                       "reply_markup": json.loads(p["reply_markup"]) if "reply_markup" in p else None}
+                STATE.sent.append(msg)
+            return self._json({"ok": True, "result": {"message_id": msg["message_id"]}})
+
         if method == "answerCallbackQuery":
             with STATE.lock:
                 STATE.answered.append(p.get("callback_query_id"))
