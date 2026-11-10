@@ -20,7 +20,10 @@ class MockTest(unittest.TestCase):
                               capture_output=True, text=True)
 
     def calls(self):
-        return [json.loads(l) for l in open(self.log)] if os.path.exists(self.log) else []
+        if not os.path.exists(self.log):
+            return []
+        with open(self.log) as f:
+            return [json.loads(l) for l in f]
 
     def test_git_read_passthrough(self):
         r = self.run_mock(GIT, "status", "--short")

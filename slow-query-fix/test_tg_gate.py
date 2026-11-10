@@ -12,7 +12,12 @@ import time
 import unittest
 import urllib.request
 
+import urllib.error
+from io import BytesIO
+from unittest import mock as umock
+
 import mock_telegram
+import tg_gate
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GATE = os.path.join(HERE, "tg_gate.py")
@@ -94,6 +99,17 @@ class GateTest(unittest.TestCase):
         mock("POST", "/_mock/say", {"text": "/stop", "user_id": ME})
         self.assertEqual(self.run_gate("notify", "Этап 2").returncode, 10)
 
+    def test_notify_step_prefix(self):
+        r = self.run_gate("notify", "Этап готов", "--step", "3/10")
+        self.assertEqual(r.returncode, 0)
+        msgs = mock("GET", "/_mock/messages")
+        self.assertEqual(msgs[-1]["text"], "<b>[3/10]</b> Этап готов")
+
+    def test_notify_without_step_has_no_prefix(self):
+        self.run_gate("notify", "без прогресса")
+        msgs = mock("GET", "/_mock/messages")
+        self.assertEqual(msgs[-1]["text"], "без прогресса")
+
     # --- check ---
     def test_check_quiet_returns_0(self):
         self.assertEqual(self.run_gate("check").returncode, 0)
@@ -130,6 +146,12 @@ class GateTest(unittest.TestCase):
     def test_gate_stop_text(self):
         rc, _, _ = self.answer_gate(say="/stop")
         self.assertEqual(rc, 10)
+
+    def test_gate_step_prefix(self):
+        rc, _, _ = self.answer_gate("--step", "5/10", press="go")
+        self.assertEqual(rc, 0)
+        msgs = mock("GET", "/_mock/messages")
+        self.assertEqual(msgs[0]["text"], "<b>[5/10]</b> Продолжить?")
 
     def test_gate_has_three_buttons(self):
         self.answer_gate(press="go")
@@ -175,6 +197,98 @@ class GateTest(unittest.TestCase):
         env = {k: v for k, v in self.env.items() if k not in ("SLOWQUERY_TG_TOKEN", "SLOWQUERY_TG_CHAT_ID")}
         env["SLOWQUERY_ENV_FILE"] = path
         self.assertEqual(self.run_gate("notify", "из файла", env=env).returncode, 0)
+
+
+class FormatTextTest(unittest.TestCase):
+    def test_plain_text_unchanged(self):
+        self.assertEqual(tg_gate.format_text("Этап 1 готов"), "Этап 1 готов")
+
+    def test_backticks_become_code_tags(self):
+        self.assertEqual(tg_gate.format_text("таблица `orders`, индекс `idx_email`"),
+                          "таблица <code>orders</code>, индекс <code>idx_email</code>")
+
+    def test_html_specials_escaped_outside_code(self):
+        self.assertEqual(tg_gate.format_text("created_at < NOW() && x > 0"),
+                          "created_at &lt; NOW() &amp;&amp; x &gt; 0")
+
+    def test_html_specials_escaped_inside_code(self):
+        self.assertEqual(tg_gate.format_text("условие `a < b`"), "условие <code>a &lt; b</code>")
+
+    def test_step_prefix_is_bold(self):
+        self.assertEqual(tg_gate.format_text("текст", "3/10"), "<b>[3/10]</b> текст")
+
+    def test_step_value_is_escaped_too(self):
+        self.assertEqual(tg_gate.format_text("текст", "<3>"), "<b>[&lt;3&gt;]</b> текст")
+
+    def test_triple_backtick_becomes_pre_block(self):
+        text = "До\n```\nSELECT * FROM orders\nWHERE id = 1\n```\nПосле"
+        out = tg_gate.format_text(text)
+        self.assertEqual(out, "До\n<pre><code>SELECT * FROM orders\nWHERE id = 1\n</code></pre>\nПосле")
+
+    def test_triple_backtick_with_language_tag_strips_it(self):
+        text = "```sql\nSELECT 1\n```"
+        out = tg_gate.format_text(text)
+        self.assertEqual(out, "<pre><code>SELECT 1\n</code></pre>")
+
+    def test_triple_and_single_backticks_mixed(self):
+        text = "Таблица `orders`:\n```\nSELECT *\n```\nиндекс `idx_x`"
+        out = tg_gate.format_text(text)
+        self.assertEqual(out, "Таблица <code>orders</code>:\n<pre><code>SELECT *\n</code></pre>\nиндекс <code>idx_x</code>")
+
+    def test_code_block_contents_escaped(self):
+        text = "```\na < b && c\n```"
+        out = tg_gate.format_text(text)
+        self.assertEqual(out, "<pre><code>a &lt; b &amp;&amp; c\n</code></pre>")
+
+    def test_long_text_is_truncated(self):
+        out = tg_gate.format_text("x" * 5000)
+        self.assertEqual(len(out), tg_gate.RAW_TEXT_LIMIT)
+
+    def test_truncation_does_not_break_an_unclosed_tag(self):
+        # бэктик, не влезший целиком в лимит, не должен давать незакрытый <code>
+        text = "`" + "x" * (tg_gate.RAW_TEXT_LIMIT + 10) + "`"
+        out = tg_gate.format_text(text)
+        self.assertNotIn("<code>", out)
+        self.assertNotIn("</code>", out)
+
+
+class ApiRetryTest(unittest.TestCase):
+    """api() должен переживать временные сетевые сбои, не падая с кода 2 сразу."""
+
+    def _fake_ok_response(self):
+        # BytesIO уже реализует протокол контекстного менеджера (как HTTPResponse)
+        return BytesIO(json.dumps({"ok": True, "result": {"message_id": 1}}).encode())
+
+    def test_transient_error_then_success_retries(self):
+        cfg = {"SLOWQUERY_TG_TOKEN": "t", "SLOWQUERY_TG_CHAT_ID": "1"}
+        calls = {"n": 0}
+
+        def flaky_urlopen(*a, **kw):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise urllib.error.URLError("boom")
+            return self._fake_ok_response()
+
+        with umock.patch("tg_gate.urllib.request.urlopen", side_effect=flaky_urlopen), \
+             umock.patch("tg_gate.time.sleep"):
+            res = tg_gate.api(cfg, "sendMessage", {"chat_id": "1", "text": "x"})
+        self.assertTrue(res["ok"])
+        self.assertEqual(calls["n"], 3)
+
+    def test_persistent_error_exits_2_after_retries(self):
+        cfg = {"SLOWQUERY_TG_TOKEN": "t", "SLOWQUERY_TG_CHAT_ID": "1"}
+        calls = {"n": 0}
+
+        def always_fails(*a, **kw):
+            calls["n"] += 1
+            raise urllib.error.URLError("boom")
+
+        with umock.patch("tg_gate.urllib.request.urlopen", side_effect=always_fails), \
+             umock.patch("tg_gate.time.sleep"):
+            with self.assertRaises(SystemExit) as ctx:
+                tg_gate.api(cfg, "sendMessage", {"chat_id": "1", "text": "x"}, retries=2)
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertEqual(calls["n"], 3)  # 1 исходная попытка + 2 ретрая
 
 
 if __name__ == "__main__":

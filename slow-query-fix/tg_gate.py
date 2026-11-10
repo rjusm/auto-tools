@@ -8,10 +8,20 @@ tools/slow-query-fix/.env.local (в .gitignore), формат KEY=VALUE:
     SLOWQUERY_TG_USER_ID=...    # (необязательно) id пользователя; по умолчанию = chat id
 
 Команды:
-    notify "текст"                 отправить сообщение, не ждать (exit 0)
-    gate "текст" [--timeout 1800]  сообщение с кнопками [Продолжить][Пропустить][Стоп]
+    notify "текст" [--step N/M]    отправить сообщение, не ждать (exit 0)
+    gate "текст" [--timeout 1800] [--step N/M]
+                                   сообщение с кнопками [Продолжить][Пропустить][Стоп]
                                    и ожидание ответа
     check                          неблокирующая проверка: не нажали ли Стоп / не пришло ли /stop
+
+--step N/M добавляет префикс "[N/M] " (жирным) к тексту — прогресс по этапам скилла
+(N — номер текущего уведомления/gate, M — примерное общее число; не обязателен).
+
+Форматирование текста (как в SKILL.md): `короткий код` — инлайн-моноширинный
+(имя таблицы/колонки/флаг); тройные бэктики ```...``` (можно с языком,
+```sql ... ```) — отдельный блок кода, для SQL/EXPLAIN/диффов в несколько строк.
+Остальной текст отправляется как обычный, HTML экранируется автоматически
+(< > & безопасны в любом месте текста).
 
 Коды выхода:
     0   продолжить (gate: нажато "Продолжить"; notify/check: всё ок)
@@ -26,6 +36,7 @@ SLOWQUERY_ENV_FILE и SLOWQUERY_STATE_FILE (изолированные конф�
 import argparse
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -58,21 +69,60 @@ def load_cfg():
     return cfg
 
 
-def api(cfg, method, params=None, timeout=15):
+def api(cfg, method, params=None, timeout=15, retries=2, backoff=1.0):
     base = os.environ.get("SLOWQUERY_TG_API_BASE", "https://api.telegram.org").rstrip("/")
     url = "%s/bot%s/%s" % (base, cfg["SLOWQUERY_TG_TOKEN"], method)
     data = urllib.parse.urlencode(params or {}).encode()
-    try:
-        with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=timeout) as r:
-            return json.load(r)
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        # не печатаем URL: в нём токен
-        sys.stderr.write("tg_gate: ошибка запроса к Telegram (%s)\n" % type(e).__name__)
-        sys.exit(2)
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=timeout) as r:
+                return json.load(r)
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            if attempt < retries:
+                time.sleep(backoff * (attempt + 1))
+                continue
+            # не печатаем URL: в нём токен
+            sys.stderr.write("tg_gate: ошибка запроса к Telegram (%s), после %d попыток\n" %
+                              (type(e).__name__, retries + 1))
+            sys.exit(2)
 
 
-def send(cfg, text, markup=None):
-    p = {"chat_id": cfg["SLOWQUERY_TG_CHAT_ID"], "text": text[:4000]}
+RAW_TEXT_LIMIT = 3500  # с запасом под HTML-теги относительно лимита Telegram в 4096
+
+
+def escape_html(s):
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def format_text(text, step=None):
+    """Экранирует HTML и форматирует код по markdown-конвенции (как в SKILL.md):
+      ```[язык]\\nмного строк\\n```  -> отдельный блок <pre><code> (SQL, EXPLAIN, диффы)
+      `текст`                        -> инлайн <code> (имя таблицы/колонки/флаг)
+    [N/M] (если передан step) делается жирным.
+
+    Обрезка — по исходному (неэкранированному) тексту, чтобы не разорвать тег:
+    если тройные бэктики не влезли целиком в лимит, незакрытый фрагмент остаётся
+    обычным (неотформатированным) текстом — безопасно, но без подсветки.
+    """
+    text = text[:RAW_TEXT_LIMIT]
+    block_parts = re.split(r"```(?:[\w+-]*\n)?(.*?)```", text, flags=re.S)
+    pieces = []
+    for i, part in enumerate(block_parts):
+        if i % 2:  # между тройными бэктиками — блок кода целиком
+            pieces.append("<pre><code>%s</code></pre>" % escape_html(part))
+        else:
+            inline_parts = re.split(r"`([^`]+)`", part)
+            pieces.append("".join(
+                "<code>%s</code>" % escape_html(p) if j % 2 else escape_html(p)
+                for j, p in enumerate(inline_parts)))
+    escaped = "".join(pieces)
+    if step:
+        escaped = "<b>[%s]</b> %s" % (escape_html(str(step)), escaped)
+    return escaped
+
+
+def send(cfg, html_text, markup=None):
+    p = {"chat_id": cfg["SLOWQUERY_TG_CHAT_ID"], "text": html_text, "parse_mode": "HTML"}
     if markup:
         p["reply_markup"] = json.dumps(markup)
     res = api(cfg, "sendMessage", p)
@@ -103,7 +153,7 @@ def poll(cfg, wait):
     off = get_offset()
     res = api(cfg, "getUpdates", {"offset": off, "timeout": wait,
                                   "allowed_updates": json.dumps(["message", "callback_query"])},
-              timeout=wait + 10)
+              timeout=wait + 10, retries=0)  # долгий опрос уже повторяется в вызывающем цикле
     events = []
     for u in res.get("result", []):
         off = max(off, u["update_id"] + 1)
@@ -134,13 +184,15 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     n = sub.add_parser("notify"); n.add_argument("text")
+    n.add_argument("--step", metavar="N/M", help="прогресс, например 3/10 — добавится префиксом [3/10]")
     g = sub.add_parser("gate"); g.add_argument("text"); g.add_argument("--timeout", type=int, default=1800)
+    g.add_argument("--step", metavar="N/M", help="прогресс, например 3/10 — добавится префиксом [3/10]")
     sub.add_parser("check")
     a = ap.parse_args()
     cfg = load_cfg()
 
     if a.cmd == "notify":
-        send(cfg, a.text)
+        send(cfg, format_text(a.text, a.step))
         # заодно проверим, не просили ли остановиться
         rc = interpret(poll(cfg, 0))
         sys.exit(10 if rc == 10 else 0)
@@ -148,12 +200,12 @@ def main():
     if a.cmd == "check":
         rc = interpret(poll(cfg, 0))
         if rc == 10:
-            send(cfg, "Получен СТОП. Процесс остановлен.")
+            send(cfg, format_text("Получен СТОП. Процесс остановлен."))
         sys.exit(10 if rc == 10 else 0)
 
     if a.cmd == "gate":
         poll(cfg, 0)  # сбросить старые апдейты, чтобы не поймать прошлое нажатие
-        send(cfg, a.text, {"inline_keyboard": [[
+        send(cfg, format_text(a.text, a.step), {"inline_keyboard": [[
             {"text": "Продолжить", "callback_data": "go"},
             {"text": "Пропустить этап", "callback_data": "skip"},
             {"text": "Стоп", "callback_data": "stop"}]]})
@@ -161,10 +213,10 @@ def main():
         while time.time() < deadline:
             rc = interpret(poll(cfg, min(25, max(1, int(deadline - time.time())))))
             if rc is not None:
-                send(cfg, {0: "Принято: продолжаю.", 12: "Принято: этап пропущен.",
-                           10: "Принято: СТОП. Процесс остановлен."}[rc])
+                send(cfg, format_text({0: "Принято: продолжаю.", 12: "Принято: этап пропущен.",
+                                       10: "Принято: СТОП. Процесс остановлен."}[rc]))
                 sys.exit(rc)
-        send(cfg, "Нет ответа за %d мин. Процесс остановлен." % (a.timeout // 60))
+        send(cfg, format_text("Нет ответа за %d мин. Процесс остановлен." % (a.timeout // 60)))
         sys.exit(11)
 
 
